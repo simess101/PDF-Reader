@@ -1,0 +1,9 @@
+[package]
+name = "pdf-reader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+anyhow = "1"
+flate2 = "1"
