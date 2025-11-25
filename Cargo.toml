@@ -7,3 +7,4 @@ edition = "2021"
 eframe = "0.27"
 anyhow = "1"
 flate2 = "1"
+image = { version = "0.24", features = ["jpeg", "png"] }

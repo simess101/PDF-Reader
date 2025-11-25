@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Read;
+
 use eframe::{egui, NativeOptions};
+use image::DynamicImage;
 
 // -------------------- Basic PDF value types --------------------
 
@@ -52,17 +54,14 @@ impl PdfFile {
     pub fn open(path: &str) -> Result<Self> {
         let data = fs::read(path).with_context(|| format!("reading {path}"))?;
 
-        // Check header
         if !data.starts_with(b"%PDF-") {
             return Err(anyhow!("Not a PDF: missing %PDF- header"));
         }
 
-        // Find startxref
         let startxref_pos =
             find_startxref(&data).ok_or_else(|| anyhow!("Could not find startxref"))?;
         let xref_offset = parse_startxref(&data[startxref_pos..])?;
 
-        // Parse xref table and trailer
         let (xref, trailer) = parse_xref_and_trailer(&data, xref_offset)?;
 
         Ok(PdfFile { data, xref, trailer })
@@ -80,7 +79,6 @@ impl PdfFile {
             .xref
             .get(&r.obj_num)
             .ok_or_else(|| anyhow!("No xref entry for object {}", r.obj_num))?;
-
         parse_indirect_object(&self.data, *offset, r.obj_num, r.gen)
     }
 
@@ -181,14 +179,9 @@ impl PdfFile {
 
 fn find_startxref(data: &[u8]) -> Option<usize> {
     let needle = b"startxref";
-    // look in the last 1 KB of the file
     let start = data.len().saturating_sub(1024);
     let slice = &data[start..];
-    if let Some(rel_pos) = find_subsequence(slice, needle) {
-        Some(start + rel_pos)
-    } else {
-        None
-    }
+    find_subsequence(slice, needle).map(|rel| start + rel)
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -204,7 +197,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn parse_startxref(chunk: &[u8]) -> Result<usize> {
-    // chunk starts at "startxref"
     let s = std::str::from_utf8(chunk)?;
     let mut lines = s.lines();
 
@@ -230,13 +222,9 @@ fn parse_xref_and_trailer(
 ) -> Result<(HashMap<u32, usize>, HashMap<String, PdfValue>)> {
     let mut pos = xref_offset;
 
-    // Expect "xref"
     consume_whitespace(data, &mut pos);
     if !consume_keyword(data, &mut pos, b"xref") {
-        return Err(anyhow!(
-            "Expected 'xref' at offset {}",
-            xref_offset
-        ));
+        return Err(anyhow!("Expected 'xref' at offset {}", xref_offset));
     }
 
     let mut xref: HashMap<u32, usize> = HashMap::new();
@@ -244,17 +232,14 @@ fn parse_xref_and_trailer(
     loop {
         consume_whitespace(data, &mut pos);
 
-        // Next should be "trailer" or a subsection header: "<first> <count>"
         if match_keyword(data, pos, b"trailer") {
             break;
         }
 
-        // parse "first_object count"
         let first = parse_unsigned_int(data, &mut pos)?;
         consume_whitespace(data, &mut pos);
         let count = parse_unsigned_int(data, &mut pos)?;
 
-        // each entry is "offset generation n/f"
         for i in 0..count {
             consume_whitespace(data, &mut pos);
             let offset = parse_unsigned_int(data, &mut pos)?;
@@ -264,9 +249,8 @@ fn parse_xref_and_trailer(
             let in_use_flag =
                 data.get(pos)
                     .ok_or_else(|| anyhow!("Unexpected EOF in xref entry"))?;
-            pos += 1; // skip 'n' or 'f'
+            pos += 1;
 
-            // line end
             if let Some(b'\r') = data.get(pos) {
                 pos += 1;
             }
@@ -281,7 +265,6 @@ fn parse_xref_and_trailer(
         }
     }
 
-    // Now parse "trailer" dictionary
     consume_whitespace(data, &mut pos);
     if !consume_keyword(data, &mut pos, b"trailer") {
         return Err(anyhow!("Expected 'trailer' after xref"));
@@ -297,13 +280,7 @@ fn parse_xref_and_trailer(
 fn consume_whitespace(data: &[u8], pos: &mut usize) {
     while *pos < data.len() {
         let b = data[*pos];
-        if b == b' '
-            || b == b'\t'
-            || b == b'\n'
-            || b == b'\r'
-            || b == b'\x0C'
-            || b == b'\x00'
-        {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x00) {
             *pos += 1;
         } else {
             break;
@@ -348,7 +325,6 @@ fn parse_indirect_object(
     let mut pos = offset;
     consume_whitespace(data, &mut pos);
 
-    // Expect "<obj_num> <gen> obj"
     let parsed_obj = parse_unsigned_int(data, &mut pos)? as u32;
     consume_whitespace(data, &mut pos);
     let parsed_gen = parse_unsigned_int(data, &mut pos)? as u16;
@@ -368,10 +344,8 @@ fn parse_indirect_object(
     pos = new_pos;
     consume_whitespace(data, &mut pos);
 
-    // Handle stream
     if let PdfValue::Dictionary(dict) = &value {
         if consume_keyword(data, &mut pos, b"stream") {
-            // optional EOL after 'stream'
             if let Some(b'\r') = data.get(pos) {
                 pos += 1;
             }
@@ -379,7 +353,6 @@ fn parse_indirect_object(
                 pos += 1;
             }
 
-            // length comes from /Length
             let length = match dict.get("Length") {
                 Some(PdfValue::Integer(n)) => *n as usize,
                 Some(PdfValue::Ref(r)) => {
@@ -398,7 +371,6 @@ fn parse_indirect_object(
             let raw_stream = data[pos..pos + length].to_vec();
             pos += length;
 
-            // after stream data: "endstream"
             let mut end_pos = pos;
             consume_whitespace(data, &mut end_pos);
             if !consume_keyword(data, &mut end_pos, b"endstream") {
@@ -411,7 +383,6 @@ fn parse_indirect_object(
                 data: raw_stream,
             };
 
-            // After endstream there should be "endobj"
             consume_whitespace(data, &mut pos);
             if !consume_keyword(data, &mut pos, b"endobj") {
                 return Err(anyhow!("Missing endobj after stream object"));
@@ -419,7 +390,6 @@ fn parse_indirect_object(
 
             Ok(PdfValue::Stream(stream))
         } else {
-            // Dictionary object without stream
             consume_whitespace(data, &mut pos);
             if !consume_keyword(data, &mut pos, b"endobj") {
                 return Err(anyhow!("Missing endobj after dictionary object"));
@@ -427,7 +397,6 @@ fn parse_indirect_object(
             Ok(PdfValue::Dictionary(dict.clone()))
         }
     } else {
-        // Non-dict object
         consume_whitespace(data, &mut pos);
         if !consume_keyword(data, &mut pos, b"endobj") {
             return Err(anyhow!("Missing endobj after object"));
@@ -464,18 +433,11 @@ fn parse_value(data: &[u8], mut pos: usize) -> Result<(PdfValue, usize)> {
             let start = pos;
             while pos < data.len() {
                 let c = data[pos];
-                if c == b' '
-                    || c == b'\t'
-                    || c == b'\n'
-                    || c == b'\r'
-                    || c == b'<'
-                    || c == b'>'
-                    || c == b'['
-                    || c == b']'
-                    || c == b'/'
-                    || c == b'('
-                    || c == b')'
-                {
+                if matches!(
+                    c,
+                    b' ' | b'\t' | b'\n' | b'\r' | b'<' | b'>' | b'[' | b']' | b'/'
+                        | b'(' | b')'
+                ) {
                     break;
                 }
                 pos += 1;
@@ -514,7 +476,6 @@ fn parse_value(data: &[u8], mut pos: usize) -> Result<(PdfValue, usize)> {
             PdfValue::Array(items)
         }
         b'<' => {
-            // dictionary or hex string
             if pos + 1 < data.len() && data[pos + 1] == b'<' {
                 let (dict, new_pos) = parse_dictionary(data, pos)?;
                 pos = new_pos;
@@ -554,7 +515,6 @@ fn parse_value(data: &[u8], mut pos: usize) -> Result<(PdfValue, usize)> {
         }
     };
 
-    // Detect "<int> <int> R" pattern = indirect reference
     if let PdfValue::Integer(n1) = v {
         let mut look = pos;
         consume_whitespace(data, &mut look);
@@ -658,25 +618,9 @@ fn hex_to_bytes(hex: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-// -------------------- Caesar decode helper (for your test PDF) --------------------
-
-fn caesar_decode_alpha(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if ('A'..='Z').contains(&ch) {
-            let offset = (ch as u8 - b'A' + 26 - 3) % 26;
-            out.push((b'A' + offset) as char);
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 // -------------------- Stream decoding --------------------
 
 fn decode_stream(stream: &PdfStream) -> Result<Vec<u8>> {
-    // Only handle no filter or simple /FlateDecode for now
     let filter = stream.dict.get("Filter");
     let has_flate = match filter {
         None => false,
@@ -693,12 +637,11 @@ fn decode_stream(stream: &PdfStream) -> Result<Vec<u8>> {
         decoder.read_to_end(&mut out)?;
         Ok(out)
     } else {
-        // no filter we know about, just return raw
         Ok(stream.data.clone())
     }
 }
 
-// -------------------- Resources helper --------------------
+// -------------------- Resources + ToUnicode --------------------
 
 fn get_page_resources(pdf: &PdfFile, page: &PdfPage) -> Result<HashMap<String, PdfValue>> {
     if let Some(res_val) = page.dict.get("Resources") {
@@ -708,9 +651,131 @@ fn get_page_resources(pdf: &PdfFile, page: &PdfPage) -> Result<HashMap<String, P
             _ => Err(anyhow!("Page /Resources is not a dictionary")),
         }
     } else {
-        // Some PDFs inherit resources from parents; we ignore that for now
         Ok(HashMap::new())
     }
+}
+
+// Map: font resource name (e.g., "F1") -> (code -> char)
+type FontCMap = HashMap<u16, char>;
+type FontMap = HashMap<String, FontCMap>;
+
+fn parse_tounicode_cmap(data: &[u8]) -> Result<FontCMap> {
+    let s = String::from_utf8_lossy(data);
+    let mut map: FontCMap = HashMap::new();
+
+    let mut tokens = s.split_whitespace();
+    let mut mode: Option<&str> = None;
+
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "beginbfchar" => mode = Some("bfchar"),
+            "endbfchar" => mode = None,
+            "beginbfrange" => mode = Some("bfrange"),
+            "endbfrange" => mode = None,
+            _ => {
+                if mode == Some("bfchar") {
+                    if tok.starts_with('<') && tok.ends_with('>') {
+                        let src_hex = tok.trim_matches(&['<', '>'][..]);
+                        if let Some(dst_tok) = tokens.next() {
+                            let dst_hex = dst_tok.trim_matches(&['<', '>'][..]);
+                            if let (Ok(src), Ok(dst)) = (
+                                u16::from_str_radix(src_hex, 16),
+                                u16::from_str_radix(dst_hex, 16),
+                            ) {
+                                if let Some(ch) = std::char::from_u32(dst as u32) {
+                                    map.insert(src, ch);
+                                }
+                            }
+                        }
+                    }
+                } else if mode == Some("bfrange") {
+                    if tok.starts_with('<') && tok.ends_with('>') {
+                        let start_hex = tok.trim_matches(&['<', '>'][..]);
+                        let end_tok = tokens
+                            .next()
+                            .ok_or_else(|| anyhow!("bfrange missing end code"))?;
+                        let dst_tok = tokens
+                            .next()
+                            .ok_or_else(|| anyhow!("bfrange missing dst start"))?;
+
+                        let end_hex = end_tok.trim_matches(&['<', '>'][..]);
+                        let dst_hex = dst_tok.trim_matches(&['<', '>'][..]);
+
+                        let start = u16::from_str_radix(start_hex, 16)?;
+                        let end = u16::from_str_radix(end_hex, 16)?;
+                        let mut dst = u16::from_str_radix(dst_hex, 16)?;
+
+                        for code in start..=end {
+                            if let Some(ch) = std::char::from_u32(dst as u32) {
+                                map.insert(code, ch);
+                            }
+                            dst = dst.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(map)
+}
+
+fn build_font_maps(pdf: &PdfFile, resources: &HashMap<String, PdfValue>) -> FontMap {
+    let mut fonts: FontMap = HashMap::new();
+
+    if let Some(PdfValue::Dictionary(font_dict)) = resources.get("Font") {
+        for (name, font_val) in font_dict {
+            let font_obj = match pdf.resolve_ref(font_val) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let font_dict2 = match font_obj {
+                PdfValue::Dictionary(d) => d,
+                _ => continue,
+            };
+
+            if let Some(tounicode_val) = font_dict2.get("ToUnicode") {
+                let tu_obj = match pdf.resolve_ref(tounicode_val) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let PdfValue::Stream(s) = tu_obj {
+                    if let Ok(bytes) = decode_stream(&s) {
+                        if let Ok(cmap) = parse_tounicode_cmap(&bytes) {
+                            fonts.insert(name.clone(), cmap);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fonts
+}
+
+fn decode_string_with_font(raw: &[u8], current_font: &Option<String>, fonts: &FontMap) -> String {
+    if let Some(font_name) = current_font {
+        if let Some(cmap) = fonts.get(font_name) {
+            if raw.len() % 2 == 0 && !cmap.is_empty() {
+                let mut out = String::new();
+                let mut i = 0;
+                while i + 1 < raw.len() {
+                    let code = ((raw[i] as u16) << 8) | (raw[i + 1] as u16);
+                    if let Some(ch) = cmap.get(&code) {
+                        out.push(*ch);
+                    } else {
+                        // fallback: just show something instead of blank
+                        out.push('?');
+                    }
+                    i += 2;
+                }
+                return out;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(raw).to_string()
 }
 
 // -------------------- Text extraction --------------------
@@ -718,31 +783,30 @@ fn get_page_resources(pdf: &PdfFile, page: &PdfPage) -> Result<HashMap<String, P
 fn extract_text_from_page(pdf: &PdfFile, page: &PdfPage) -> Result<String> {
     let streams = pdf.get_page_contents_streams(page)?;
     let resources = get_page_resources(pdf, page)?;
-    let mut full_text = String::new();
+    let font_maps = build_font_maps(pdf, &resources);
 
+    let mut full_text = String::new();
     for s in streams {
         let decoded = decode_stream(&s)?;
-        extract_text_from_bytes(pdf, &decoded, &resources, &mut full_text)?;
+        extract_text_from_bytes(&decoded, &font_maps, &mut full_text)?;
     }
-
     Ok(full_text)
 }
 
 fn extract_text_from_bytes(
-    pdf: &PdfFile,
     data: &[u8],
-    resources: &HashMap<String, PdfValue>,
+    fonts: &FontMap,
     full_text: &mut String,
 ) -> Result<()> {
     let mut i = 0;
-    let mut stack: Vec<String> = Vec::new(); // for string operands
+    let mut stack: Vec<Vec<u8>> = Vec::new(); // raw string operands
     let mut in_text_object = false;
-    let mut last_name: Option<String> = None; // e.g., /X0 before Do
+    let mut last_name: Option<String> = None;
+    let mut current_font: Option<String> = None;
 
     while i < data.len() {
-        // Skip whitespace
         while i < data.len()
-            && (data[i] == b' ' || data[i] == b'\t' || data[i] == b'\r' || data[i] == b'\n')
+            && matches!(data[i], b' ' | b'\t' | b'\r' | b'\n')
         {
             i += 1;
         }
@@ -752,46 +816,39 @@ fn extract_text_from_bytes(
 
         let c = data[i];
 
-        // literal string: (Hello)
         if c == b'(' {
             i += 1;
             let start = i;
-            // naive: read until ')'
             while i < data.len() && data[i] != b')' {
                 i += 1;
             }
-            let s_bytes = &data[start..i];
+            let s_bytes = data[start..i].to_vec();
             if i < data.len() && data[i] == b')' {
                 i += 1;
             }
-            let s = String::from_utf8_lossy(s_bytes).to_string();
-            stack.push(s);
+            stack.push(s_bytes);
             continue;
         }
 
-        // operator or name/hex token: read until whitespace
+        // operator / name / hex token
         let start = i;
         while i < data.len()
-            && data[i] != b' '
-            && data[i] != b'\t'
-            && data[i] != b'\r'
-            && data[i] != b'\n'
+            && !matches!(data[i], b' ' | b'\t' | b'\r' | b'\n')
         {
             i += 1;
         }
         let token = &data[start..i];
         let tok_str = String::from_utf8_lossy(token).to_string();
 
-        // Hex string in content stream: <4869...>
+        // hex string like <002B0044...>
         if tok_str.starts_with('<') && tok_str.ends_with('>') && tok_str.len() > 2 {
             let inner = &tok_str[1..tok_str.len() - 1];
             let bytes = hex_to_bytes(inner.as_bytes())?;
-            let s = String::from_utf8_lossy(&bytes).to_string();
-            stack.push(s);
+            stack.push(bytes);
             continue;
         }
 
-        // Names like /F1, /X0, etc.
+        // Names (/F1 etc.)
         if tok_str.starts_with('/') {
             last_name = Some(tok_str[1..].to_string());
             continue;
@@ -805,39 +862,22 @@ fn extract_text_from_bytes(
                 in_text_object = false;
                 full_text.push('\n');
             }
-            "Tj" => {
-                if in_text_object {
-                    if let Some(text) = stack.pop() {
-                        let decoded = caesar_decode_alpha(&text);
-                        full_text.push_str(&decoded);
-                    }
-                }
-            }
-            "TJ" => {
-                if in_text_object {
-                    if let Some(text) = stack.pop() {
-                        let decoded = caesar_decode_alpha(&text);
-                        full_text.push_str(&decoded);
-                    }
-                }
-            }
-            "Do" => {
-                // 'Do' draws an XObject. Often forms (sub-streams) contain text.
+            "Tf" => {
                 if let Some(name) = &last_name {
-                    if let Some(PdfValue::Dictionary(xobjs)) = resources.get("XObject") {
-                        if let Some(PdfValue::Ref(r)) = xobjs.get(name) {
-                            let obj = pdf.get_object(*r)?;
-                            if let PdfValue::Stream(x_stream) = obj {
-                                let decoded = decode_stream(&x_stream)?;
-                                // recurse into the XObject content
-                                extract_text_from_bytes(pdf, &decoded, resources, full_text)?;
-                            }
-                        }
+                    current_font = Some(name.clone());
+                }
+                // ignore font size operand; we don't use it here
+            }
+            "Tj" | "TJ" => {
+                if in_text_object {
+                    if let Some(raw) = stack.pop() {
+                        let decoded = decode_string_with_font(&raw, &current_font, fonts);
+                        full_text.push_str(&decoded);
                     }
                 }
             }
             _ => {
-                // ignore for now (Td/Tm/etc)
+                // ignore other operators (Td/Tm/etc.) for now
             }
         }
     }
@@ -845,24 +885,80 @@ fn extract_text_from_bytes(
     Ok(())
 }
 
-// -------------------- Simple GUI app --------------------
+// -------------------- Image extraction (very simple) --------------------
+
+fn extract_images_from_page(pdf: &PdfFile, page: &PdfPage) -> Result<Vec<DynamicImage>> {
+    let resources = get_page_resources(pdf, page)?;
+    let mut out = Vec::new();
+
+    if let Some(PdfValue::Dictionary(xobjs)) = resources.get("XObject") {
+        for (_name, val) in xobjs {
+            let obj = pdf.resolve_ref(val)?;
+            if let PdfValue::Stream(stream) = obj {
+                if let Some(PdfValue::Name(subtype)) = stream.dict.get("Subtype") {
+                    if subtype == "Image" {
+                        let data = decode_stream(&stream)?;
+                        if let Ok(img) = image::load_from_memory(&data) {
+                            out.push(img);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+// -------------------- GUI structures --------------------
+
+struct PageData {
+    text: String,
+    images: Vec<DynamicImage>,
+}
 
 struct PdfApp {
-    pages: Vec<String>,
+    pages: Vec<PageData>,
     current_page: usize,
+    // cache textures for the current page only
+    tex_page_index: Option<usize>,
+    tex_handles: Vec<egui::TextureHandle>,
 }
 
 impl eframe::App for PdfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Ensure textures for current page
+        if self.tex_page_index != Some(self.current_page) {
+            // drop old textures
+            self.tex_handles.clear();
+            if let Some(page) = self.pages.get(self.current_page) {
+                for (idx, img) in page.images.iter().enumerate() {
+                    let rgb = img.to_rgba8();
+                    let size = [img.width() as usize, img.height() as usize];
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied(size, &rgb);
+                    let handle = ctx.load_texture(
+                        format!("page{}_img{}", self.current_page, idx),
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    self.tex_handles.push(handle);
+                }
+            }
+            self.tex_page_index = Some(self.current_page);
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Prev").clicked() && self.current_page > 0 {
                     self.current_page -= 1;
+                    self.tex_page_index = None;
                 }
                 if ui.button("Next").clicked()
                     && self.current_page + 1 < self.pages.len()
                 {
                     self.current_page += 1;
+                    self.tex_page_index = None;
                 }
                 ui.label(format!(
                     "Page {}/{}",
@@ -877,7 +973,22 @@ impl eframe::App for PdfApp {
                 if self.pages.is_empty() {
                     ui.label("(no pages)");
                 } else {
-                    ui.monospace(&self.pages[self.current_page]);
+                    // show page text
+                    ui.monospace(&self.pages[self.current_page].text);
+            
+                    ui.separator();
+            
+                    // show images for this page
+                    let page = &self.pages[self.current_page];
+                    if !page.images.is_empty() {
+                        ui.heading("Images on this page:");
+                        for tex in &self.tex_handles {
+                            let size = egui::Vec2::new(tex.size()[0] as f32, tex.size()[1] as f32);
+                            ui.image((tex.id(), size));
+                            // Removed redundant or undefined variable usage
+                            ui.add_space(12.0);
+                        }
+                    }
                 }
             });
         });
@@ -918,21 +1029,25 @@ fn main() -> Result<()> {
     let root_obj = pdf.get_object(root)?;
     println!("Root object value: {:#?}\n", root_obj);
 
-    let pages = pdf.load_all_pages()?;
-    println!("Found {} page(s)\n", pages.len());
+    let pages_vec = pdf.load_all_pages()?;
+    println!("Found {} page(s)\n", pages_vec.len());
 
     if use_gui {
-        let mut page_texts = Vec::new();
-        for page in &pages {
-            match extract_text_from_page(&pdf, page) {
-                Ok(text) => page_texts.push(text),
-                Err(e) => page_texts.push(format!("Error extracting text: {e}")),
-            }
+        let mut page_data = Vec::new();
+        for page in &pages_vec {
+            let text = match extract_text_from_page(&pdf, page) {
+                Ok(t) => t,
+                Err(e) => format!("Error extracting text: {e}"),
+            };
+            let images = extract_images_from_page(&pdf, page).unwrap_or_default();
+            page_data.push(PageData { text, images });
         }
 
         let app = PdfApp {
-            pages: page_texts,
+            pages: page_data,
             current_page: 0,
+            tex_page_index: None,
+            tex_handles: Vec::new(),
         };
 
         let native_options = NativeOptions::default();
@@ -943,7 +1058,7 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow!("GUI error: {e}"))?;
     } else {
-        for (i, page) in pages.iter().enumerate() {
+        for (i, page) in pages_vec.iter().enumerate() {
             println!("===== Page {} =====", i + 1);
             match extract_text_from_page(&pdf, page) {
                 Ok(text) => {
